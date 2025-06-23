@@ -4,7 +4,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.openapi.utils import get_openapi
 from sqlmodel import SQLModel, Field, Session, create_engine, select
-from typing import Optional, List
+from typing import Optional, List, Dict
 from pydantic import BaseModel, EmailStr
 from datetime import datetime, timedelta
 from jose import JWTError, jwt
@@ -29,6 +29,7 @@ RATE_PERIOD = 60
 
 
 # ---------------- Rate Limiting -----------------
+
 
 class RateLimiter:
 
@@ -104,6 +105,28 @@ class NoteUpdate(BaseModel):
     content: Optional[str] = None
 
 
+# PUBLIC_INTERFACE
+class BulkDeleteNotesRequest(BaseModel):
+    """
+    Request model specifying a list of note IDs for bulk deletion.
+    """
+    note_ids: List[int] = Field(..., description="List of note IDs to delete.")
+
+
+# PUBLIC_INTERFACE
+class BulkDeleteNotesResult(BaseModel):
+    """
+    Output model summarizing how many notes deleted, not found, or disallowed.
+    """
+    deleted_ids: List[int]
+    not_found_ids: List[int]
+    not_owned_ids: List[int]
+    details: Dict[str, str] = Field(
+        default_factory=dict,
+        description="Detailed deletion results by note ID (keys are the IDs as str)."
+    )
+
+
 class UserCreate(BaseModel):
     username: str
     email: EmailStr
@@ -128,8 +151,9 @@ def get_password_hash(password):
 
 def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
     to_encode = data.copy()
-    expire = datetime.utcnow() + (expires_delta or timedelta(
-        minutes=ACCESS_TOKEN_EXPIRE_MINUTES))
+    expire = datetime.utcnow() + (
+        expires_delta or timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    )
     to_encode.update({"exp": expire})
     encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
     return encoded_jwt
@@ -384,6 +408,82 @@ async def delete_note(
     session.delete(db_note)
     session.commit()
     return {"message": "Note deleted."}
+
+
+# PUBLIC_INTERFACE
+@app.delete(
+    "/api/notes/bulk-delete",
+    response_model=BulkDeleteNotesResult,
+    tags=["Notes"],
+    dependencies=[Depends(rate_limit)],
+    summary="Bulk delete notes",
+    description=(
+        "Delete multiple notes by IDs for the authenticated user. "
+        "Only notes owned by the user are deleted. "
+        "Notes not found or not owned are reported. "
+        "Returns lists of deleted, not found, and not owned IDs."
+    ),
+    responses={
+        200: {"description": "Bulk deletion summary."},
+        400: {"description": "Bad request or validation error."},
+        401: {"description": "Not authenticated."},
+        429: {"description": "Rate limit exceeded."}
+    }
+)
+async def bulk_delete_notes(
+    req: BulkDeleteNotesRequest,
+    user: User = Depends(get_current_user),
+    session: Session = Depends(get_db_session)
+):
+    """
+    Delete multiple notes for the authenticated user.
+
+    - Only deletes notes owned by the user.
+    - Notes not found or not owned will be reported.
+    - Returns lists of deleted, not found, and not owned IDs, with details.
+
+    **Request:**
+        - List of note IDs (JSON body)
+
+    **Returns:**
+        - Lists of deleted, not found, not owned IDs and details per ID.
+    """
+    note_ids = set(req.note_ids)
+    if not note_ids:
+        raise HTTPException(status_code=400, detail="No note IDs provided.")
+    user_notes = session.exec(
+        select(Note).where(
+            (Note.id.in_(note_ids)) & (Note.owner_id == user.id)
+        )
+    ).all()
+    user_note_id_set = {n.id for n in user_notes}
+    not_found = []
+    not_owned = []
+    details = {}
+    found_notes = session.exec(
+        select(Note).where(Note.id.in_(note_ids))
+    ).all()
+    found_id_set = {n.id for n in found_notes}
+    for nid in note_ids:
+        if nid not in found_id_set:
+            not_found.append(nid)
+            details[str(nid)] = "Not found"
+        elif nid not in user_note_id_set:
+            not_owned.append(nid)
+            details[str(nid)] = "Not owned by user"
+    deleted = []
+    for n in user_notes:
+        session.delete(n)
+        deleted.append(n.id)
+        details[str(n.id)] = "Deleted"
+    session.commit()
+    result = BulkDeleteNotesResult(
+        deleted_ids=deleted,
+        not_found_ids=not_found,
+        not_owned_ids=not_owned,
+        details=details,
+    )
+    return result
 
 
 @app.get("/", tags=["Root"], include_in_schema=False)
