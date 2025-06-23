@@ -1,0 +1,4 @@
+{
+    "command": "source venv/bin/activate && uvicorn src.api.main:app --host 0.0.0.0 --port <port> --reload",
+    "working_directory": "/home/kavia/workspace/code-generation/securenotesapi-32904-6ee9596b/notes_api_backend_workspace/notes_api_backend"
+}
